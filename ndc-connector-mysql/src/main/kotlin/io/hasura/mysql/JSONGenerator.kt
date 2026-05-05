@@ -51,31 +51,45 @@ object JsonQueryGenerator : BaseQueryGenerator() {
     fun buildJSONSelectionForQueryRequest(
         request: QueryRequest,
         parentTable: String? = null,
-        parentRelationship: Relationship? = null
+        parentRelationship: Relationship? = null,
+        // Unique alias for this subquery's table reference. When the relationship source and target are
+        // the same collection (self-join), passing a distinct alias prevents both sides of the JOIN
+        // condition from resolving to the same table, which would make MySQL silently return no rows.
+        collectionAlias: String? = null
     ): JSONObjectNullStep<*> {
-        val baseTable = DSL.table(tojOOQName(request.collection))
+        val effectiveAlias = collectionAlias ?: request.collection
+
+        // When a unique alias is provided, alias the FROM table so that the outer table name remains
+        // visible in the correlated WHERE clause (e.g. FROM regions AS parentRegion_regions).
+        val baseTable = if (collectionAlias != null) {
+            DSL.table(tojOOQName(request.collection)).`as`(DSL.name(effectiveAlias))
+        } else {
+            DSL.table(tojOOQName(request.collection))
+        }
 
         val baseQuery = DSL.select(
             baseTable.asterisk()
         ).select(
-            getSelectOrderFields(request)
+            getSelectOrderFields(request, effectiveAlias)
         ).from(
             baseTable
         )
 
-        addJoinsRequiredForOrderByFields2(baseQuery, request)
+        addJoinsRequiredForOrderByFields2(baseQuery, request, effectiveAlias)
 
         if (parentRelationship != null && parentTable != null) {
             baseQuery.where(
-                mkJoinWhereClause(parentTable, parentRelationship)
+                mkJoinWhereClause(parentTable, parentRelationship, effectiveAlias)
             )
         }
 
         if (request.query.predicate != null) {
-            baseQuery.where(getWhereConditions(request))
+            baseQuery.where(
+                expressionToCondition(request.query.predicate!!, request, effectiveAlias)
+            )
 
             val requiredJoinTables = collectRequiredJoinTablesForWhereClause(
-                rootTable = request.collection,
+                rootTable = effectiveAlias,
                 where = request.query.predicate!!,
                 collectionRelationships = request.collection_relationships
             )
@@ -99,7 +113,7 @@ object JsonQueryGenerator : BaseQueryGenerator() {
             // to prevent duplicate rows
             if (requiredJoinTables.isNotEmpty()) {
                 baseQuery.groupBy(
-                    getSelectOrderFields(request)
+                    getSelectOrderFields(request, effectiveAlias)
                 )
             }
 
@@ -108,7 +122,7 @@ object JsonQueryGenerator : BaseQueryGenerator() {
             baseQuery.orderBy(
                 translateIROrderByField(
                     orderBy = request.query.order_by,
-                    currentCollection = request.collection,
+                    currentCollection = effectiveAlias,
                     relationships = request.collection_relationships
                 )
             )
@@ -120,7 +134,7 @@ object JsonQueryGenerator : BaseQueryGenerator() {
             baseQuery.offset(request.query.offset)
         }
 
-        val baseSelection = baseQuery.asTable(DSL.name(tojOOQName(request.collection)))
+        val baseSelection = baseQuery.asTable(DSL.name(tojOOQName(effectiveAlias)))
 
         return DSL.jsonObject(
             buildList {
@@ -157,9 +171,17 @@ object JsonQueryGenerator : BaseQueryGenerator() {
                                                             request.collection_relationships[field.relationship]
                                                                 ?: error("Relationship ${field.relationship} not found")
 
+                                                        // Derive a unique inner alias from the field alias and target
+                                                        // collection. This ensures the inner subquery is never aliased
+                                                        // the same as the outer table, which would make both sides of a
+                                                        // self-join WHERE condition resolve to the same scope.
+                                                        val innerAlias = "${alias}_${relationship.target_collection}"
+                                                            .replace(".", "_")
+
                                                         val subQuery = buildJSONSelectionForQueryRequest(
-                                                            parentTable = request.collection,
+                                                            parentTable = effectiveAlias,
                                                             parentRelationship = relationship,
+                                                            collectionAlias = innerAlias,
                                                             request = QueryRequest(
                                                                 collection = relationship.target_collection,
                                                                 collection_relationships = request.collection_relationships,
@@ -186,7 +208,7 @@ object JsonQueryGenerator : BaseQueryGenerator() {
                                             }
                                         )
                                     ).orderBy(
-                                        getConcatOrderFields(request)
+                                        getConcatOrderFields(request, effectiveAlias)
                                     ),
                                     DSL.jsonArray()
                                 )
@@ -311,11 +333,15 @@ object JsonQueryGenerator : BaseQueryGenerator() {
 
     private fun mkJoinWhereClause(
         sourceTable: String,
-        parentRelationship: Relationship
+        parentRelationship: Relationship,
+        // Alias used for the inner (target) table. Defaults to the target collection name,
+        // which preserves existing behaviour for cross-table relationships. For self-joins this
+        // must differ from sourceTable so that both sides of the condition are unambiguous.
+        innerAlias: String = parentRelationship.target_collection
     ) = DSL.and(
         parentRelationship.column_mapping.map { (from, to) ->
             val childField = DSL.field(tojOOQName(sourceTable, from))
-            val parentField = DSL.field(tojOOQName(parentRelationship.target_collection, to))
+            val parentField = DSL.field(tojOOQName(innerAlias, to))
             childField.eq(parentField)
         }
     )
@@ -323,8 +349,15 @@ object JsonQueryGenerator : BaseQueryGenerator() {
 
     private const val ORDER_FIELD_SUFFIX = "_order_field"
 
-    private fun getSelectOrderFields(request: QueryRequest): List<Field<*>> {
-        val sortFields = translateIROrderByField(request, request.collection)
+    private fun getSelectOrderFields(
+        request: QueryRequest,
+        currentCollection: String = request.collection
+    ): List<Field<*>> {
+        val sortFields = translateIROrderByField(
+            orderBy = request.query.order_by,
+            currentCollection = currentCollection,
+            relationships = request.collection_relationships
+        )
         return sortFields.map {
             // Use the qualified name (which includes the table name) to ensure uniqueness
             val field = it.`$field`()
@@ -333,8 +366,15 @@ object JsonQueryGenerator : BaseQueryGenerator() {
         }
     }
 
-    private fun getConcatOrderFields(request: QueryRequest): List<SortField<*>> {
-        val sortFields = translateIROrderByField(request, request.collection)
+    private fun getConcatOrderFields(
+        request: QueryRequest,
+        currentCollection: String = request.collection
+    ): List<SortField<*>> {
+        val sortFields = translateIROrderByField(
+            orderBy = request.query.order_by,
+            currentCollection = currentCollection,
+            relationships = request.collection_relationships
+        )
         return sortFields.map {
             // Use the qualified name (which includes the table name) to ensure uniqueness
             val field = it.`$field`()
